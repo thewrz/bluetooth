@@ -8,6 +8,7 @@ package bluetooth
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -18,7 +19,7 @@ var _ BLEAdapter = (*Adapter)(nil)
 
 type Adapter struct {
 	id                   string
-	scanCancelChan       chan struct{}
+	scan                 scanLifecycle
 	bus                  *dbus.Conn
 	bluez                dbus.BusObject // object at /
 	adapter              dbus.BusObject // object at /org/bluez/hciX
@@ -26,6 +27,67 @@ type Adapter struct {
 	defaultAdvertisement *Advertisement
 
 	connectHandler func(device Device, connected bool)
+}
+
+type scanLifecycle struct {
+	mutex      sync.Mutex
+	cancelChan chan struct{}
+	stopped    bool
+}
+
+func (s *scanLifecycle) start() (chan struct{}, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if s.cancelChan != nil {
+		return nil, errScanning
+	}
+
+	s.cancelChan = make(chan struct{})
+	s.stopped = false
+	return s.cancelChan, nil
+}
+
+func (s *scanLifecycle) stop() error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if s.cancelChan == nil || s.stopped {
+		return errNotScanning
+	}
+
+	close(s.cancelChan)
+	s.stopped = true
+	return nil
+}
+
+func (s *scanLifecycle) stopSession(cancelChan chan struct{}) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if s.cancelChan == cancelChan && !s.stopped {
+		close(cancelChan)
+		s.stopped = true
+	}
+}
+
+func (s *scanLifecycle) finish(cancelChan chan struct{}) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if s.cancelChan == cancelChan {
+		s.cancelChan = nil
+		s.stopped = false
+	}
+}
+
+func (s *scanLifecycle) cancelled(cancelChan chan struct{}) bool {
+	select {
+	case <-cancelChan:
+		return true
+	default:
+		return false
+	}
 }
 
 // NewAdapter creates a new Adapter with the given ID.
@@ -69,11 +131,11 @@ func (a *Adapter) Enable() (err error) {
 // Reset clears BlueZ state so a subsequent Enable() rebuilds it.
 // Mostly a no-op on Linux; provided for interface symmetry.
 func (a *Adapter) Reset() error {
+	_ = a.scan.stop()
 	a.bus = nil
 	a.bluez = nil
 	a.adapter = nil
 	a.address = ""
-	a.scanCancelChan = nil
 	return nil
 }
 

@@ -211,8 +211,13 @@ func (a *Advertisement) Stop() error {
 // possible some events are missed and perhaps even possible that some events
 // are duplicated.
 func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
-	if a.scanCancelChan != nil {
-		return errScanning
+	cancelChan, err := a.scan.start()
+	if err != nil {
+		return err
+	}
+	defer a.scan.finish(cancelChan)
+	if a.scan.cancelled(cancelChan) {
+		return nil
 	}
 
 	signal := make(chan *dbus.Signal)
@@ -222,13 +227,22 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
 	a.bus.AddMatchSignal(propertiesChangedMatchOptions...)
 	defer a.bus.RemoveMatchSignal(propertiesChangedMatchOptions...)
+	if a.scan.cancelled(cancelChan) {
+		return nil
+	}
 
 	newObjectMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.ObjectManager")}
 	a.bus.AddMatchSignal(newObjectMatchOptions...)
 	defer a.bus.RemoveMatchSignal(newObjectMatchOptions...)
+	if a.scan.cancelled(cancelChan) {
+		return nil
+	}
 
 	// Check if the adapter is powered on.
 	powered, err := a.adapter.GetProperty("org.bluez.Adapter1.Powered")
+	if a.scan.cancelled(cancelChan) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -236,17 +250,17 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 		return errAdaptorNotPowered
 	}
 
-	// Channel that will be closed when the scan is stopped.
-	// Detecting whether the scan is stopped can be done by doing a non-blocking
-	// read from it. If it succeeds, the scan is stopped.
-	cancelChan := make(chan struct{})
-	a.scanCancelChan = cancelChan
-
 	// This appears to be necessary to receive any BLE discovery results at all.
 	defer a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0)
+	if a.scan.cancelled(cancelChan) {
+		return nil
+	}
 	err = a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0, map[string]interface{}{
 		"Transport": "le",
 	}).Err
+	if a.scan.cancelled(cancelChan) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -258,6 +272,9 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 	// long time, long after they have moved out of range.
 	var deviceList map[dbus.ObjectPath]map[string]map[string]dbus.Variant
 	err = a.bluez.Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&deviceList)
+	if a.scan.cancelled(cancelChan) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -300,8 +317,7 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 		select {
 		case <-startDiscovery.Done:
 			if startDiscovery.Err != nil {
-				close(cancelChan)
-				a.scanCancelChan = nil
+				a.scan.stopSession(cancelChan)
 				return startDiscovery.Err
 			}
 		case sig := <-signal:
@@ -325,13 +341,11 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 					changes := sig.Body[1].(map[string]dbus.Variant)
 					if powered, ok := changes["Powered"]; ok && !powered.Value().(bool) {
 						// adapter is powered off, stop the scan
-						close(cancelChan)
-						a.scanCancelChan = nil
+						a.scan.stopSession(cancelChan)
 						return errAdaptorNotPowered
 					} else if discovering, ok := changes["Discovering"]; ok && !discovering.Value().(bool) {
 						// adapter stopped discovering unexpectedly (e.g. due to external event)
-						close(cancelChan)
-						a.scanCancelChan = nil
+						a.scan.stopSession(cancelChan)
 						return errScanStopped
 					}
 
@@ -364,12 +378,7 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 // callback to stop the current scan. If no scan is in progress, an error will
 // be returned.
 func (a *Adapter) StopScan() error {
-	if a.scanCancelChan == nil {
-		return errNotScanning
-	}
-	close(a.scanCancelChan)
-	a.scanCancelChan = nil
-	return nil
+	return a.scan.stop()
 }
 
 // makeScanResult creates a ScanResult from a raw DBus device.
