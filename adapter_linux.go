@@ -130,8 +130,14 @@ func (a *Adapter) Enable() (err error) {
 
 // Reset clears BlueZ state so a subsequent Enable() rebuilds it.
 // Mostly a no-op on Linux; provided for interface symmetry.
+// Reset returns errScanning until an active Scan call has returned.
 func (a *Adapter) Reset() error {
-	_ = a.scan.stop()
+	a.scan.mutex.Lock()
+	defer a.scan.mutex.Unlock()
+	if a.scan.cancelChan != nil {
+		return errScanning
+	}
+
 	a.bus = nil
 	a.bluez = nil
 	a.adapter = nil
